@@ -34,6 +34,13 @@ _DEFAULT_ALIGN = 256
 _has_cuda_python = importlib.util.find_spec("cuda") is not None
 
 
+def test_mooncake_correctness_contract_version_is_public():
+    import transfer_queue as tq
+
+    assert tq.MOONCAKE_CORRECTNESS_CONTRACT_VERSION == 1
+    assert "MOONCAKE_CORRECTNESS_CONTRACT_VERSION" in tq.__all__
+
+
 def _aligned(n: int) -> int:
     return (n + _DEFAULT_ALIGN - 1) // _DEFAULT_ALIGN * _DEFAULT_ALIGN
 
@@ -376,12 +383,18 @@ class TestClear:
             client.clear(["k0"], custom_backend_meta=None)
         assert "custom_backend_meta" not in caplog.text
 
-    def test_error_code_triggers_log(self, caplog):
+    def test_non_idempotent_failure_is_raised(self):
         client = _make_clear_client(use_gdr=False)
         client._store.batch_remove.side_effect = lambda keys, force: [-1] * len(keys)
-        with caplog.at_level(logging.ERROR, logger="transfer_queue.storage.clients.mooncake_client"):
+        with pytest.raises(RuntimeError, match=r"batch_remove failed: k0=-1"):
             client.clear(["k0"])
-        assert "remove failed" in caplog.text
+
+    def test_short_result_is_raised(self):
+        client = _make_clear_client(use_gdr=False)
+        client._store.batch_remove.return_value = [0]
+        client._store.batch_remove.side_effect = None
+        with pytest.raises(RuntimeError, match="returned 1 results, expected 2"):
+            client.clear(["k0", "k1"])
 
     def test_already_removed_code_704_is_silent(self, caplog):
         client = _make_clear_client(use_gdr=False)
@@ -395,3 +408,64 @@ class TestClear:
         with caplog.at_level(logging.ERROR):
             client.clear(["k0"])
         assert "remove failed" not in caplog.text
+
+
+class _SequenceStore:
+    """Return configured results from each low-level Mooncake batch call."""
+
+    def __init__(self, results):
+        self.results = iter(results)
+
+    def batch_upsert_from(self, keys, ptrs, sizes, config=None):
+        return next(self.results)
+
+    def batch_get_into(self, keys, ptrs, sizes):
+        return next(self.results)
+
+
+def _make_retry_client(store):
+    from transfer_queue.storage.clients.mooncake_client import MooncakeStoreClient
+
+    client = object.__new__(MooncakeStoreClient)
+    client._store = store
+    client.replica_config = None
+    return client
+
+
+class TestBatchResultValidation:
+    @pytest.mark.parametrize("error_type", [TypeError, ValueError, OverflowError])
+    def test_result_length_error_is_wrapped(self, error_type):
+        from transfer_queue.storage.clients.mooncake_client import _validate_batch_result_count
+
+        error = error_type("invalid result length")
+        results = MagicMock()
+        results.__len__.side_effect = error
+
+        with pytest.raises(RuntimeError, match="returned a non-sized result, expected 2 codes") as exc_info:
+            _validate_batch_result_count("batch_remove", ["k0", "k1"], results)
+
+        assert exc_info.value.__cause__ is error
+
+    def test_upsert_retry_short_result_is_raised(self, monkeypatch):
+        monkeypatch.setattr("transfer_queue.storage.clients.mooncake_client.RETRY_DELAY_SECONDS", 0)
+        client = _make_retry_client(_SequenceStore([[-1, -1], [0]]))
+
+        with pytest.raises(RuntimeError, match="batch_upsert_from returned 1 results, expected 2"):
+            client._batch_upsert_with_retry(["k0", "k1"], [1, 2], [8, 8])
+
+    def test_get_retry_short_result_is_raised(self, monkeypatch):
+        monkeypatch.setattr("transfer_queue.storage.clients.mooncake_client.RETRY_DELAY_SECONDS", 0)
+        client = _make_retry_client(_SequenceStore([[-1, -1], [0]]))
+
+        with pytest.raises(RuntimeError, match="batch_get_into returned 1 results, expected 2"):
+            client._batch_get_into_with_retry(["k0", "k1"], [1, 2], [8, 8])
+
+    @pytest.mark.parametrize("operation", ["upsert", "get"])
+    def test_non_sized_result_is_raised(self, operation):
+        client = _make_retry_client(_SequenceStore([None]))
+
+        with pytest.raises(RuntimeError, match="returned a non-sized result, expected 2 codes"):
+            if operation == "upsert":
+                client._batch_upsert_with_retry(["k0", "k1"], [1, 2], [8, 8])
+            else:
+                client._batch_get_into_with_retry(["k0", "k1"], [1, 2], [8, 8])

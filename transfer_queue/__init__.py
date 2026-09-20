@@ -45,6 +45,10 @@ from .sampler.seqlen_balanced_sampler import SeqlenBalancedSampler
 from .sampler.sequential_sampler import SequentialSampler
 from .sampler.streaming_token_budget_sampler import StreamingTokenBudgetSampler
 
+# Version 1 guarantees Mooncake batch/retry result-count validation,
+# batch_remove failure propagation, and fail-closed production-status ACKs.
+MOONCAKE_CORRECTNESS_CONTRACT_VERSION = 1
+
 __all__ = (
     [
         # High-Level KV Interface
@@ -80,6 +84,7 @@ __all__ = (
         "get_client",
         "BatchMeta",
         "TransferQueueClient",
+        "MOONCAKE_CORRECTNESS_CONTRACT_VERSION",
     ]
     + [
         # Sampler

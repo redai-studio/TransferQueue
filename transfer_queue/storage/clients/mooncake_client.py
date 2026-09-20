@@ -45,6 +45,17 @@ MAX_BATCH_WORKER_THREADS = 4
 MAX_SERIAL_WORKER_THREADS = 4
 MAX_RETRIES = 3
 RETRY_DELAY_SECONDS = 1.0
+_MOONCAKE_OBJECT_NOT_FOUND = -704
+
+
+def _validate_batch_result_count(operation: str, keys: list[str], results: Any) -> None:
+    """Require one Mooncake result code for every requested key."""
+    try:
+        actual = len(results)
+    except Exception as error:
+        raise RuntimeError(f"{operation} returned a non-sized result, expected {len(keys)} codes") from error
+    if actual != len(keys):
+        raise RuntimeError(f"{operation} returned {actual} results, expected {len(keys)}")
 
 
 @StorageClientFactory.register("MooncakeStoreClient")
@@ -529,9 +540,15 @@ class MooncakeStoreClient(StorageKVClient):
             actual_keys = keys
 
         ret_codes = self._store.batch_remove(actual_keys, force=True)
-        for i, ret in enumerate(ret_codes):
-            if not (ret == 0 or ret == -704):
-                logger.error(f"remove failed for key `{actual_keys[i]}` with error code: {ret}")
+        _validate_batch_result_count("batch_remove", actual_keys, ret_codes)
+        failures = [
+            (key, code)
+            for key, code in zip(actual_keys, ret_codes, strict=True)
+            if code not in (0, _MOONCAKE_OBJECT_NOT_FOUND)
+        ]
+        if failures:
+            detail = ", ".join(f"{key}={code}" for key, code in failures)
+            raise RuntimeError(f"batch_remove failed: {detail}")
 
     def close(self):
         """Closes MooncakeStore."""
@@ -549,8 +566,7 @@ class MooncakeStoreClient(StorageKVClient):
         backing tensors/buffers).
         """
         results = self._store.batch_upsert_from(batch_keys, batch_ptrs, batch_sizes, config=self.replica_config)
-        if len(results) != len(batch_keys):
-            raise RuntimeError(f"batch_upsert_from returned {len(results)} results, expected {len(batch_keys)}")
+        _validate_batch_result_count("batch_upsert_from", batch_keys, results)
 
         failed_indices = [j for j, r in enumerate(results) if r != 0]
         if not failed_indices:
@@ -572,6 +588,7 @@ class MooncakeStoreClient(StorageKVClient):
             retry_results = self._store.batch_upsert_from(
                 current_failed_keys, retry_ptrs, retry_sizes, config=self.replica_config
             )
+            _validate_batch_result_count("batch_upsert_from", current_failed_keys, retry_results)
 
             next_failed_indices = []
             next_failed_keys = []
@@ -612,8 +629,7 @@ class MooncakeStoreClient(StorageKVClient):
         Caller owns the receive buffers (allocate/register/unregister).
         """
         ret_codes = self._store.batch_get_into(batch_keys, batch_buffer_ptrs, batch_nbytes)
-        if len(ret_codes) != len(batch_keys):
-            raise RuntimeError(f"batch_get_into returned {len(ret_codes)} results, expected {len(batch_keys)}")
+        _validate_batch_result_count("batch_get_into", batch_keys, ret_codes)
 
         failed_indices = [i for i, ret in enumerate(ret_codes) if ret < 0]
         if not failed_indices:
@@ -634,6 +650,7 @@ class MooncakeStoreClient(StorageKVClient):
             retry_nbytes = [batch_nbytes[i] for i in current_failed_indices]
 
             retry_codes = self._store.batch_get_into(current_failed_keys, retry_ptrs, retry_nbytes)
+            _validate_batch_result_count("batch_get_into", current_failed_keys, retry_codes)
 
             next_failed_indices = []
             next_failed_keys = []

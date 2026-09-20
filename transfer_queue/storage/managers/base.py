@@ -222,8 +222,9 @@ class StorageManager(ABC):
         """
 
         if not self.controller_info:
-            logger.warning(f"No controller connected for storage manager {self.storage_manager_id}")
-            return
+            raise RuntimeError(
+                f"Storage manager {self.storage_manager_id} has no controller for production-status notification"
+            )
 
         normalized_field_schema = {}
         for field_name, field in field_schema.items():
@@ -261,55 +262,60 @@ class StorageManager(ABC):
     async def _notify_and_wait(self, request_msg: list) -> None:
         """Send a data status notification to the controller and block until ACK is received."""
         identity = f"{self.storage_manager_id}-notify-{uuid4().hex[:8]}".encode()
-        sock = create_zmq_socket(
-            ctx=self.zmq_context, socket_type=zmq.DEALER, ip=self.controller_info.ip, identity=identity
-        )
-        sock.setsockopt(zmq.LINGER, 0)
-        sock.connect(self.controller_info.to_addr("request_handle_socket"))
-
+        sock = None
         try:
+            sock = create_zmq_socket(
+                ctx=self.zmq_context, socket_type=zmq.DEALER, ip=self.controller_info.ip, identity=identity
+            )
+            sock.setsockopt(zmq.LINGER, 0)
+            sock.connect(self.controller_info.to_addr("request_handle_socket"))
+
             await sock.send_multipart(request_msg)
             logger.debug(
                 f"[{self.storage_manager_id}]: Sent data status update request "
                 f"to controller id #{self.controller_info.id} successfully."
             )
 
-            response_received = False
-            timeout = TQ_DATA_UPDATE_RESPONSE_TIMEOUT
-
-            while not response_received and timeout > 0:
+            loop = asyncio.get_running_loop()
+            deadline = loop.time() + TQ_DATA_UPDATE_RESPONSE_TIMEOUT
+            while True:
+                remaining = deadline - loop.time()
+                if remaining <= 0:
+                    raise TimeoutError(
+                        f"Timed out waiting for production-status ACK after {TQ_DATA_UPDATE_RESPONSE_TIMEOUT}s"
+                    )
                 try:
-                    poll_interval = min(TQ_STORAGE_POLLER_TIMEOUT, timeout)
                     messages = await asyncio.wait_for(
                         sock.recv_multipart(copy=False),
-                        timeout=poll_interval,
+                        timeout=min(TQ_STORAGE_POLLER_TIMEOUT, remaining),
                     )
-                    response_msg = ZMQMessage.deserialize(messages)
-
-                    if response_msg.request_type == ZMQRequestType.NOTIFY_DATA_UPDATE_ACK:  # type: ignore[arg-type]
-                        response_received = True
-                        logger.debug(
-                            f"[{self.storage_manager_id}]: Get data status update ACK response "
-                            f"from controller id #{response_msg.sender_id} successfully."
-                        )
-                        break
                 except asyncio.TimeoutError:
-                    timeout -= poll_interval
-                except Exception as e:
-                    logger.warning(f"[{self.storage_manager_id}]: Error receiving response: {e}")
-                    break
+                    continue
+                except Exception as error:
+                    raise RuntimeError("Failed while waiting for production-status ACK") from error
 
-            if not response_received:
-                logger.error(
-                    f"[{self.storage_manager_id}]: Timeout waiting for data status update ACK "
-                    f"from controller after {TQ_DATA_UPDATE_RESPONSE_TIMEOUT}s."
+                response_msg = ZMQMessage.deserialize(messages)
+                if response_msg.request_type != ZMQRequestType.NOTIFY_DATA_UPDATE_ACK:  # type: ignore[arg-type]
+                    continue
+
+                response_body = response_msg.body if isinstance(response_msg.body, dict) else {}
+                if response_body.get("success") is not True:
+                    raise RuntimeError(
+                        "Controller rejected the production-status update "
+                        f"for partition={response_body.get('partition_id', 'unknown')}"
+                    )
+
+                logger.debug(
+                    f"[{self.storage_manager_id}]: Get data status update ACK response "
+                    f"from controller id #{response_msg.sender_id} successfully."
                 )
+                return
         finally:
             try:
-                if not sock.closed:
+                if sock is not None and not sock.closed:
                     sock.close(linger=0)
-            except Exception:
-                pass
+            except Exception as error:
+                logger.debug(f"Failed to close production-status notification socket: {error}")
 
     @abstractmethod
     async def put_data(
